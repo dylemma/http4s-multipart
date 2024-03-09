@@ -4,6 +4,7 @@ import java.nio.charset.StandardCharsets
 import scala.concurrent.duration.DurationInt
 
 import cats.data.EitherT
+import cats.effect
 import cats.effect.std.Supervisor
 import cats.effect._
 import cats.syntax.all._
@@ -51,48 +52,69 @@ object MyMultipart extends IOApp {
 		): Pull[IO, Either[DecodeFailure, A], Unit] = s.pull.uncons1.flatMap {
 			case Some((ps: PartStart, tail)) =>
 
-				Pull.eval { Channel.synchronous[IO, Chunk[Byte]] }.flatMap { ch =>
+				for {
+					// Created a shared channel that allows us to represent the `partConsumer`
+					// logic as a `Stream` consumer rather than some kind of "scan" operation.
+					// As new `PartChunk` events are pulled, they will be sent to the channel,
+					// and concurrently the `partConsumer` will consume the channel's `.stream`.
+					channel <- Pull.eval { Channel.synchronous[IO, Chunk[Byte]] }
 
-					// Create a `Resource` that can consume the Channel's `stream`
-					// to produce an output or an error. Make sure that if the
-					// Resource doesn't actually consume the whole channel stream
-					// for whatever reason (errors, ignoring, or otherwise), that
-					// we close the channel once an outcome is reached. Otherwise
-					// the producer side of the channel (i.e. the main Pull loop)
-					// would hang while trying to consume the stream of events.
-					val receiverRes = partConsumer(Part(ps.headers, ch.stream.unchunks))
-						.evalTap(_ => ch.close)
-						.handleErrorWith { (e: Throwable) =>
-							Resource.eval(ch.close *> IO.raiseError(e))
-						}
+					// Since we'll run the `partConsumer` concurrently while pulling chunk events
+					// from the input stream, we use a `Deferred` to allow us to block on the
+					// consumer's completion. This also lets us un-block the event-pull during its
+					// attempts to `send` to the channel, in case the consumer completed without
+					// consuming the entire stream.
+					resultPromise <- Pull.eval { Deferred[IO, Either[Throwable, A]] }
 
-					// Pull all `PartChunk` events until a `PartEnd` event is seen,
-					// pushing each Chunk into the channel for the resource to receive.
-					val pullPart: Pull[IO, Nothing, Stream[IO, Event]] = pullUntilPartEnd(tail, ch)
-						.handleErrorWith { err =>
-							Pull.eval(ch.close) >> Pull.raiseError[IO](err)
-						}
-						.flatMap { nextPartsStream =>
-							Pull.eval(ch.close) >> Pull.pure(nextPartsStream)
-						}
+					// Start the "receiver" fiber to run in the background, sending
+					// its result to the `resultPromise` when it becomes available
+					_ <- Pull.eval(supervisor.supervise[Nothing] {
+						partConsumer(Part(ps.headers, channel.stream.unchunks))
+							.attempt
+							.evalTap { r => resultPromise.complete(r.flatten) *> channel.close }
+							.rethrow
+							.evalTap { a => IO.println(s"  receiver allocated value: $a") }
+							// tries to allocate the resource but never close it, but since this
+							// will be started by the supervisor, when the supervisor closes, it
+							// will cancel the usage, allowing the resource to release
+							.useForever
+					})
 
-					// Allocate the resource in the background, using the supervisor's lifetime to
-					// release it later. Meanwhile, continue to pull chunk data and pipe it through
-					// the shared channel, which should allow the resource to actually allocate.
-					// When the Pull loop reaches the end of the current part, close the channel and
-					// await the resource's allocation before deciding whether to continue pulling.
-					Pull.eval(superviseResource(supervisor, receiverRes)).flatMap { resPromise =>
-						pullPart.flatMap { restOfStream =>
-							Pull.eval(resPromise.get.rethrow).flatMap { consumerResult =>
-								val cont = consumerResult.fold(
-									e => Pull.done,
-									a => pullPartStart(restOfStream),
-								)
-								Pull.output1(consumerResult) >> cont
+					// Continue pulling Chunks for the current Part, feeding them to the receiver
+					// via the shared Channel. Make sure the channel push operation doesn't block,
+					// by racing its `send` effect with `resultPromise.get`, so that if the receiver
+					// decides to abort early, we can stop trying to push to the channel. If the
+					// receiver raises an error, stop pulling completely
+					restOfStream <- {
+						pullUntilPartEnd(tail, chunk => {
+							val keepPulling = IO.pure(true)
+							val stopPulling = IO.pure(false)
+							IO.race(channel.send(chunk), resultPromise.get).flatMap {
+								case Left(_) => keepPulling // send completed normally; don't care if it was closed or not
+								case Right(Right(a)) => keepPulling // send may have blocked, but the receiver already has a result
+								case Right(Left(err)) => stopPulling // receiver raised an error, so abort the pull
 							}
-						}
+						})
+							// when this part of the Pull completes, make sure to close the channel
+							// so that the `receiver` Stream sees an EOF signal.
+							.handleErrorWith { err =>
+								println("  part puller encountered an error")
+								Pull.eval(channel.close) >> Pull.raiseError[IO](err)
+							}
+							.productL { Pull.eval(channel.close) }
 					}
-				}
+
+					// Once we've reached the end of the current part, wait until the consumer
+					// finishes and sends its result (or error) to the promise.
+					partResult <- Pull.eval(resultPromise.get)
+
+					// Output the partResult, continuing the Pull if it was not an error
+					_ <- partResult match {
+						case Right(a) => Pull.output1(Right(a)) >> pullPartStart(restOfStream)
+						case Left(e: DecodeFailure) => Pull.output1(Left(e)).covary[IO] >> Pull.done
+						case Left(e) => Pull.raiseError[IO](e)
+					}
+				} yield ()
 
 			case None =>
 				Pull.done
@@ -104,11 +126,14 @@ object MyMultipart extends IOApp {
 				Pull.raiseError[IO](new IllegalStateException("unexpected PartChunk"))
 		}
 
-		def pullUntilPartEnd(s: Stream[IO, Event], ch: Channel[IO, Chunk[Byte]]): Pull[IO, Nothing, Stream[IO, Event]] = s.pull.uncons1.flatMap {
+		def pullUntilPartEnd(s: Stream[IO, Event], pushChunk: Chunk[Byte] => IO[Boolean]): Pull[IO, Nothing, Stream[IO, Event]] = s.pull.uncons1.flatMap {
 			case Some((PartEnd, tail)) =>
 				Pull.pure(tail)
 			case Some((PartChunk(chunk), tail)) =>
-				Pull.eval(ch.send(chunk)) >> pullUntilPartEnd(tail, ch)
+				Pull.eval(pushChunk(chunk)).flatMap { keepPulling =>
+					if (keepPulling) pullUntilPartEnd(tail, pushChunk)
+					else Pull.pure(Stream.empty)
+				}
 			case Some((PartStart(_), _)) | None =>
 				Pull.raiseError[IO](new IllegalStateException("Missing PartEnd"))
 		}
@@ -136,6 +161,7 @@ object MyMultipart extends IOApp {
 				res
 					.attempt
 					.evalTap(promise.complete)
+					.evalTap(a => IO.println(s"allocated value: $a"))
 					.rethrow
 					.useForever,
 			)
@@ -144,6 +170,7 @@ object MyMultipart extends IOApp {
 
 	val receiver = (
 		MultipartReceiver[IO].textPart("foo")(_.readString),
+		MultipartReceiver[IO].filePart("file")(_.toTempFile /*.withSizeLimit(19)*/),
 		MultipartReceiver[IO].auto,
 	).tupled
 
@@ -156,7 +183,7 @@ object MyMultipart extends IOApp {
 		parseMultipartSupervised[receiver.Partial](
 			partEvents,
 			supervisor,
-			part => receiverWrapped.decide(part.headers).get.receive(part)
+			part => receiverWrapped.decide(part.headers).get.receive(part),
 		).flatMap { partials =>
 			EitherT.fromEither[IO] { receiver.assemble(partials) }
 		}
@@ -177,7 +204,7 @@ object MyMultipart extends IOApp {
 						}
 					}
 					r.receive(part)
-				}
+				},
 			).value.flatMap { res =>
 				val assembledResult = res.flatMap { partials =>
 					receiver.assemble(partials)

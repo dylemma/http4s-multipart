@@ -4,7 +4,7 @@ import cats.arrow.FunctionK
 import cats.effect.Sync
 import cats.effect.kernel.Resource
 import cats.implicits.toFoldableOps
-import cats.{ Applicative, ~> }
+import cats.{ Applicative, ApplicativeError, ~> }
 import fs2._
 import fs2.io.file.{ Files, Path }
 import org.http4s.headers.`Content-Disposition`
@@ -16,6 +16,8 @@ trait PartReceiver[F[_], A] {
 	def receive(part: Part[F]): Resource[F, Either[DecodeFailure, A]]
 
 	def map[B](f: A => B): PartReceiver[F, B] = part => this.receive(part).map(_.map(f))
+
+	def withSizeLimit(limit: Long)(implicit F: ApplicativeError[F, Throwable]): PartReceiver[F, A]  = new PartReceiver.WithSizeLimit(this, limit)
 }
 
 object PartReceiver {
@@ -34,6 +36,26 @@ object PartReceiver {
 
 		def reject[A](err: DecodeFailure): PartReceiver[F, A] =
 			part => Resource.pure(Left(err))
+	}
+
+	private class WithSizeLimit[F[_], A](inner: PartReceiver[F, A], limit: Long)(implicit F: ApplicativeError[F, Throwable]) extends PartReceiver[F, A] {
+		def receive(part: Part[F]): Resource[F, Either[DecodeFailure, A]] = {
+			def go(s: Stream[F, Byte], accumSize: Long): Pull[F, Byte, Unit] = s.pull.uncons.flatMap {
+				case Some((chunk, tail)) =>
+					val newSize = accumSize + chunk.size
+					println(s"  pulled $chunk so size is now $newSize")
+					if (newSize <= limit) Pull.output(chunk) >> go(tail, newSize)
+					else Pull.raiseError[F](InvalidMessageBodyFailure("Part body exceeds maximum length"))
+				case None =>
+					Pull.done
+			}
+			val wrappedPart = part.copy(body = go(part.body, 0L).stream)
+			inner.receive(wrappedPart)
+				.handleErrorWith[Either[DecodeFailure, A], Throwable] {
+					case e: DecodeFailure => Resource.pure(Left(e))
+					case e => Resource.raiseError[F, Either[DecodeFailure, A], Throwable](e)
+				}
+		}
 	}
 }
 
