@@ -6,7 +6,7 @@ import scala.concurrent.duration.DurationInt
 import cats.data.EitherT
 import cats.effect.std.Supervisor
 import cats.effect._
-import cats.implicits.catsSyntaxMonadErrorRethrow
+import cats.syntax.all._
 import fs2.concurrent.Channel
 import fs2.io.file.Files
 import fs2.{ Chunk, Pull, Stream }
@@ -45,7 +45,7 @@ object MyMultipart extends IOApp {
 		events: Stream[IO, Event],
 		supervisor: Supervisor[IO],
 		partConsumer: Part[IO] => Resource[IO, ParseResult[A]],
-	): EitherT[IO, ParseFailure, Vector[A]] = {
+	): EitherT[IO, ParseFailure, List[A]] = {
 		def pullPartStart(
 			s: Stream[IO, Event],
 		): Pull[IO, ParseResult[A], Unit] = s.pull.uncons1.flatMap {
@@ -123,7 +123,7 @@ object MyMultipart extends IOApp {
 			.translate(EitherT.liftK[IO, ParseFailure])
 			.flatMap(r => Stream.eval(EitherT.fromEither[IO](r)))
 			.compile
-			.toVector
+			.toList
 	}
 
 	def superviseResource[A](supervisor: Supervisor[IO], res: Resource[IO, A]): IO[Deferred[IO, Either[Throwable, A]]] = {
@@ -142,39 +142,33 @@ object MyMultipart extends IOApp {
 		} yield promise
 	}
 
-	object NamedPart {
-		def unapply[F[_]](part: Part[F]) = part.name
-	}
+	val receiver = (
+		MultipartReceiver[IO].expectString("foo"),
+		MultipartReceiver[IO].auto,
+	).tupled
 
 	def run(args: List[String]): IO[ExitCode] = {
 		Supervisor[IO].use { supervisor =>
-			parseMultipartSupervised[(String, String)](
+			parseMultipartSupervised[receiver.Partial](
 				exampleEvents.covary[IO].metered(50.millis).evalTap(IO.println),
 				supervisor,
-				{
-					case p @ NamedPart("foo") =>
-						Resource.eval(IO { Right("ignore me" -> "blah") })
-						// Resource.pure(ParseResult.fail("oopsie", ""))
-						// Resource.eval(IO.raiseErro
-						// r(new Exception("boom!")))
-						// Resource.eval(IO.never[(String, String)])
-					case p @ NamedPart(name) =>
-						for {
-							_ <- Resource.eval(IO.println(s"  [consumer] Start parsing $name body"))
-							//						body <- s.through(fs2.text.utf8.decode).compile.resource.string
-							tempFile <- Files[IO].tempFile
-							_ <- Resource.eval(p.body.through(Files[IO].writeAll(tempFile)).compile.drain)
-							//_ <- Resource.make(IO.println(s"Consumed $name as $body. (Allocated)"))(_ => IO.println(s"Release $name resource"))
-							_ <- Resource.make(IO.println(s"  [consumer] Dumped $name body to $tempFile"))(_ => {
-								IO.println(s"  [consumer] Releasing temp file $tempFile")
-							})
-						} yield Right(name -> tempFile.toString)
-
-					case p =>
-						Resource.pure(ParseResult.fail("Missing name for part", ""))
-				},
+				part => {
+					val r = receiver.decide(part.headers).getOrElse {
+						PartReceiver[IO].reject[receiver.Partial] {
+							part.name match {
+								case None => ParseFailure("Unexpected anonymous part", "")
+								case Some(name) => ParseFailure(s"Unexpected part: '$name'", "")
+							}
+						}
+					}
+					r.receive(part)
+				}
 			).value.flatMap { res =>
-				IO.println(s"[RESULT] All parts hopefully allocated: $res").as(ExitCode.Success).andWait(1.second)
+				val assembledResult = res.flatMap { partials =>
+					receiver.assemble(partials)
+				}
+
+				IO.println(s"[RESULT] All parts hopefully allocated: $assembledResult").as(ExitCode.Success).andWait(1.second)
 			}
 
 		} <* IO.println("closed supervisor")
