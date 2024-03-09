@@ -3,17 +3,15 @@ package io.dylemma.sandbox
 import java.nio.charset.StandardCharsets
 import scala.concurrent.duration.DurationInt
 
-import cats.arrow.FunctionK
 import cats.data.EitherT
 import cats.effect.std.Supervisor
-import cats.effect.{ Deferred, ExitCode, IO, IOApp, Resource }
+import cats.effect._
 import cats.implicits.catsSyntaxMonadErrorRethrow
-import cats.syntax.traverse._
 import fs2.concurrent.Channel
 import fs2.io.file.Files
 import fs2.{ Chunk, Pull, Stream }
-import org.http4s.Headers
 import org.http4s.multipart.Part
+import org.http4s.{ Headers, ParseFailure, ParseResult }
 
 object MyMultipart extends IOApp {
 	sealed trait Event
@@ -43,14 +41,14 @@ object MyMultipart extends IOApp {
 		PartEnd,
 	))
 
-	def parseMultipartSupervised[A, E](
+	def parseMultipartSupervised[A](
 		events: Stream[IO, Event],
 		supervisor: Supervisor[IO],
-		decider: Part[IO] => Resource[IO, Either[E, A]],
-	): EitherT[IO, E, Vector[A]] = {
+		partConsumer: Part[IO] => Resource[IO, ParseResult[A]],
+	): EitherT[IO, ParseFailure, Vector[A]] = {
 		def pullPartStart(
 			s: Stream[IO, Event],
-		): Pull[IO, Either[E, A], Unit] = s.pull.uncons1.flatMap {
+		): Pull[IO, ParseResult[A], Unit] = s.pull.uncons1.flatMap {
 			case Some((ps: PartStart, tail)) =>
 
 				Pull.eval { Channel.synchronous[IO, Chunk[Byte]] }.flatMap { ch =>
@@ -62,7 +60,7 @@ object MyMultipart extends IOApp {
 					// we close the channel once an outcome is reached. Otherwise
 					// the producer side of the channel (i.e. the main Pull loop)
 					// would hang while trying to consume the stream of events.
-					val receiverRes = decider(Part(ps.headers, ch.stream.unchunks))
+					val receiverRes = partConsumer(Part(ps.headers, ch.stream.unchunks))
 						.evalTap(_ => ch.close)
 						.handleErrorWith { (e: Throwable) =>
 							Resource.eval(ch.close *> IO.raiseError(e))
@@ -88,7 +86,7 @@ object MyMultipart extends IOApp {
 							Pull.eval(resPromise.get.rethrow).flatMap { consumerResult =>
 								val cont = consumerResult.fold(
 									e => Pull.done,
-									a => pullPartStart(restOfStream)
+									a => pullPartStart(restOfStream),
 								)
 								Pull.output1(consumerResult) >> cont
 							}
@@ -122,7 +120,7 @@ object MyMultipart extends IOApp {
 		// can be exposed to client code.
 		pullPartStart(events)
 			.stream
-			.translate(EitherT.liftK[IO, E])
+			.translate(EitherT.liftK[IO, ParseFailure])
 			.flatMap(r => Stream.eval(EitherT.fromEither[IO](r)))
 			.compile
 			.toVector
@@ -139,7 +137,7 @@ object MyMultipart extends IOApp {
 					.attempt
 					.evalTap(promise.complete)
 					.rethrow
-					.useForever
+					.useForever,
 			)
 		} yield promise
 	}
@@ -150,16 +148,16 @@ object MyMultipart extends IOApp {
 
 	def run(args: List[String]): IO[ExitCode] = {
 		Supervisor[IO].use { supervisor =>
-			parseMultipartSupervised[(String, String), String](
+			parseMultipartSupervised[(String, String)](
 				exampleEvents.covary[IO].metered(50.millis).evalTap(IO.println),
 				supervisor,
 				{
 					case p @ NamedPart("foo") =>
 						Resource.eval(IO { Right("ignore me" -> "blah") })
-						//					Resource.pure(Left("oopsie"))
+						// Resource.pure(ParseResult.fail("oopsie", ""))
 						// Resource.eval(IO.raiseErro
 						// r(new Exception("boom!")))
-						//					Resource.eval(IO.never[(String, String)])
+						// Resource.eval(IO.never[(String, String)])
 					case p @ NamedPart(name) =>
 						for {
 							_ <- Resource.eval(IO.println(s"  [consumer] Start parsing $name body"))
@@ -171,6 +169,9 @@ object MyMultipart extends IOApp {
 								IO.println(s"  [consumer] Releasing temp file $tempFile")
 							})
 						} yield Right(name -> tempFile.toString)
+
+					case p =>
+						Resource.pure(ParseResult.fail("Missing name for part", ""))
 				},
 			).value.flatMap { res =>
 				IO.println(s"[RESULT] All parts hopefully allocated: $res").as(ExitCode.Success).andWait(1.second)
