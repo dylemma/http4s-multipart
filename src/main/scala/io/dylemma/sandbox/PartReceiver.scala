@@ -9,7 +9,7 @@ import fs2._
 import fs2.io.file.{ Files, Path }
 import org.http4s.headers.`Content-Disposition`
 import org.http4s.multipart.Part
-import org.http4s.{ DecodeFailure, EntityBody, Headers, InvalidMessageBodyFailure }
+import org.http4s.{ DecodeFailure, EntityBody, EntityDecoder, Headers, InvalidMessageBodyFailure }
 import org.typelevel.ci.CIStringSyntax
 
 trait PartReceiver[F[_], A] {
@@ -17,7 +17,20 @@ trait PartReceiver[F[_], A] {
 
 	def map[B](f: A => B): PartReceiver[F, B] = part => this.receive(part).map(_.map(f))
 
-	def withSizeLimit(limit: Long)(implicit F: ApplicativeError[F, Throwable]): PartReceiver[F, A]  = new PartReceiver.WithSizeLimit(this, limit)
+	def tapStart(onStart: F[Unit]): PartReceiver[F, A] =
+		part => Resource.eval(onStart).flatMap { _ => this.receive(part) }
+
+	def tapResult(onResult: Either[DecodeFailure, A] => F[Unit]): PartReceiver[F, A] =
+		part => this.receive(part).evalTap(onResult)
+
+	def tapRelease(onRelease: F[Unit])(implicit F: Applicative[F]): PartReceiver[F, A] =
+		part => Resource.make(F.unit)(_ => onRelease).flatMap { _ => this.receive(part) }
+
+	def preprocess(transformPartBody: Pipe[F, Byte, Byte]): PartReceiver[F, A] =
+		part => this.receive(part.copy(body = transformPartBody(part.body)))
+
+	def withSizeLimit(limit: Long)(implicit F: ApplicativeError[F, Throwable]): PartReceiver[F, A] =
+		preprocess(PartReceiver.limitPartSize[F](limit))
 }
 
 object PartReceiver {
@@ -26,7 +39,7 @@ object PartReceiver {
 
 	class PartialApply[F[_]] {
 		def readString(implicit F: RaiseThrowable[F], cmp: Compiler[F, F]): PartReceiver[F, String] =
-			part => Resource.eval(part.bodyText.compile.string).map(Right(_))
+			part => Resource.eval { part.bodyText.compile.string }.map(Right(_))
 
 		def toTempFile(implicit F: Files[F], c: Compiler[F, F]): PartReceiver[F, Path] =
 			part => F.tempFile.evalTap { path => part.body.through(F.writeAll(path)).compile.drain }.map(Right(_))
@@ -36,26 +49,26 @@ object PartReceiver {
 
 		def reject[A](err: DecodeFailure): PartReceiver[F, A] =
 			part => Resource.pure(Left(err))
+
+		def decode[A](implicit decoder: EntityDecoder[F, A]): PartReceiver[F, A] =
+			part => Resource.eval(decoder.decode(part, strict = false).value)
+
+		def decodeStrict[A](implicit decoder: EntityDecoder[F, A]): PartReceiver[F, A] =
+			part => Resource.eval(decoder.decode(part, strict = true).value)
+
 	}
 
-	private class WithSizeLimit[F[_], A](inner: PartReceiver[F, A], limit: Long)(implicit F: ApplicativeError[F, Throwable]) extends PartReceiver[F, A] {
-		def receive(part: Part[F]): Resource[F, Either[DecodeFailure, A]] = {
-			def go(s: Stream[F, Byte], accumSize: Long): Pull[F, Byte, Unit] = s.pull.uncons.flatMap {
-				case Some((chunk, tail)) =>
-					val newSize = accumSize + chunk.size
-					println(s"  pulled $chunk so size is now $newSize")
-					if (newSize <= limit) Pull.output(chunk) >> go(tail, newSize)
-					else Pull.raiseError[F](InvalidMessageBodyFailure("Part body exceeds maximum length"))
-				case None =>
-					Pull.done
-			}
-			val wrappedPart = part.copy(body = go(part.body, 0L).stream)
-			inner.receive(wrappedPart)
-				.handleErrorWith[Either[DecodeFailure, A], Throwable] {
-					case e: DecodeFailure => Resource.pure(Left(e))
-					case e => Resource.raiseError[F, Either[DecodeFailure, A], Throwable](e)
-				}
+	private def limitPartSize[F[_]](maxPartSizeBytes: Long)(implicit F: ApplicativeError[F, Throwable]): Pipe[F, Byte, Byte] = {
+		def go(s: Stream[F, Byte], accumSize: Long): Pull[F, Byte, Unit] = s.pull.uncons.flatMap {
+			case Some((chunk, tail)) =>
+				val newSize = accumSize + chunk.size
+				if (newSize <= maxPartSizeBytes) Pull.output(chunk) >> go(tail, newSize)
+				else Pull.raiseError[F](InvalidMessageBodyFailure("Part body exceeds maximum length"))
+			case None =>
+				Pull.done
 		}
+
+		go(_, 0L).stream
 	}
 }
 
@@ -64,12 +77,18 @@ trait MultipartReceiver[F[_], A] { self =>
 	def decide(partHeaders: Headers): Option[PartReceiver[F, Partial]]
 	def assemble(partials: List[Partial]): Either[DecodeFailure, A]
 
-	def ignoreUnexpectedParts: MultipartReceiver[F, A] = new MultipartReceiver.IgnoreUnexpected[F, A, Partial](this)
-	def rejectUnexpectedParts: MultipartReceiver.Aux[F, A, Partial] = new MultipartReceiver.RejectUnexpected[F, A, Partial](this)
+	def ignoreUnexpectedParts: MultipartReceiver[F, A] =
+		new MultipartReceiver.IgnoreUnexpected[F, A, Partial](this)
+
+	def rejectUnexpectedParts: MultipartReceiver.Aux[F, A, Partial] =
+		new MultipartReceiver.RejectUnexpected[F, A, Partial](this)
+
+	def transformParts(f: PartReceiver[F, Partial] => PartReceiver[F, Partial]): MultipartReceiver[F, A] =
+		new MultipartReceiver.TransformPart[F, A, Partial](this, f)
 }
 
 object MultipartReceiver {
-	type Aux[F[_], A, P] = MultipartReceiver[F, A] { type Partial = P }
+	type Aux[F[_], A, P] = MultipartReceiver[F, A] {type Partial = P}
 
 	def apply[F[_]] = new PartialApply[F]
 
@@ -165,7 +184,7 @@ object MultipartReceiver {
 
 	}
 
-	private class IgnoreUnexpected[F[_], A, P](inner: MultipartReceiver.Aux[F, A, P]) extends MultipartReceiver[F, A] {
+	private class IgnoreUnexpected[F[_], A, P](inner: Aux[F, A, P]) extends MultipartReceiver[F, A] {
 		type Partial = Option[P]
 		def decide(partHeaders: Headers): Option[PartReceiver[F, Partial]] = {
 			Some(inner.decide(partHeaders).map(_.map[Partial](Some(_))).getOrElse {
@@ -177,7 +196,7 @@ object MultipartReceiver {
 		}
 	}
 
-	private class RejectUnexpected[F[_], A, P](inner: MultipartReceiver.Aux[F, A, P]) extends MultipartReceiver[F, A] {
+	private class RejectUnexpected[F[_], A, P](inner: Aux[F, A, P]) extends MultipartReceiver[F, A] {
 		type Partial = P
 		def decide(partHeaders: Headers): Option[PartReceiver[F, P]] = inner.decide(partHeaders).orElse {
 			Some(PartReceiver[F].reject[Partial] {
@@ -187,6 +206,12 @@ object MultipartReceiver {
 				}
 			})
 		}
+		def assemble(partials: List[P]): Either[DecodeFailure, A] = inner.assemble(partials)
+	}
+
+	private class TransformPart[F[_], A, P](inner: Aux[F, A, P], f: PartReceiver[F, P] => PartReceiver[F, P]) extends MultipartReceiver[F, A] {
+		type Partial = P
+		def decide(partHeaders: Headers): Option[PartReceiver[F, P]] = inner.decide(partHeaders).map(f)
 		def assemble(partials: List[P]): Either[DecodeFailure, A] = inner.assemble(partials)
 	}
 

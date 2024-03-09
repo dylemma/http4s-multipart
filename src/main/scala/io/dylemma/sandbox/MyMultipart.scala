@@ -1,52 +1,25 @@
 package io.dylemma.sandbox
 
-import java.nio.charset.StandardCharsets
-import scala.concurrent.duration.DurationInt
-
 import cats.data.EitherT
-import cats.effect
-import cats.effect.std.Supervisor
 import cats.effect._
+import cats.effect.std.Supervisor
 import cats.syntax.all._
 import fs2.concurrent.Channel
-import fs2.io.file.Files
-import fs2.{ Chunk, Pull, Stream }
+import fs2.{ Chunk, Pipe, Pull, Stream }
 import org.http4s.multipart.Part
-import org.http4s.{ DecodeFailure, DecodeResult, Headers, InvalidMessageBodyFailure, MalformedMessageBodyFailure, ParseResult }
+import org.http4s.{ DecodeFailure, DecodeResult, Headers }
 
-object MyMultipart extends IOApp {
+object MyMultipart {
 	sealed trait Event
 	case class PartStart(headers: Headers) extends Event
 	case class PartChunk(chunk: Chunk[Byte]) extends Event
 	case object PartEnd extends Event
 
-	def mockPartStart(name: String) = PartStart(Part.formData[IO](name, "<ignored>").headers)
-	def mockFilePartStart(name: String, filename: String) = PartStart(Part.fileData[IO](name, filename, Stream.empty).headers)
-
-	val exampleEvents = fs2.Stream.emits(List(
-		mockPartStart("foo"),
-		PartChunk(Chunk.array("bar".getBytes(StandardCharsets.UTF_8))),
-		PartEnd,
-		mockFilePartStart("file", "bar.txt"),
-		PartChunk(Chunk.array("""{ "hello": """.getBytes(StandardCharsets.UTF_8))),
-		PartChunk(Chunk.array(""""world" }""".getBytes(StandardCharsets.UTF_8))),
-		PartChunk(Chunk.array("""{ "hello": """.getBytes(StandardCharsets.UTF_8))),
-		PartChunk(Chunk.array(""""world" }""".getBytes(StandardCharsets.UTF_8))),
-		PartChunk(Chunk.array("""{ "hello": """.getBytes(StandardCharsets.UTF_8))),
-		PartChunk(Chunk.array(""""world" }""".getBytes(StandardCharsets.UTF_8))),
-		PartEnd,
-		mockPartStart("bop"),
-		PartChunk(Chunk.array("bippity ".getBytes(StandardCharsets.UTF_8))),
-		PartChunk(Chunk.array("boppity ".getBytes(StandardCharsets.UTF_8))),
-		PartChunk(Chunk.array("boo".getBytes(StandardCharsets.UTF_8))),
-		PartEnd,
-	))
-
-	def parseMultipartSupervised[A](
-		events: Stream[IO, Event],
+	def decodeMultipartEvents[A](
 		supervisor: Supervisor[IO],
-		partConsumer: Part[IO] => Resource[IO, Either[DecodeFailure, A]],
-	): EitherT[IO, DecodeFailure, List[A]] = {
+		partDecoder: Part[IO] => DecodeResult[Resource[IO, *], A],
+	): Pipe[IO, Event, Either[DecodeFailure, A]] = {
+
 		def pullPartStart(
 			s: Stream[IO, Event],
 		): Pull[IO, Either[DecodeFailure, A], Unit] = s.pull.uncons1.flatMap {
@@ -69,11 +42,10 @@ object MyMultipart extends IOApp {
 					// Start the "receiver" fiber to run in the background, sending
 					// its result to the `resultPromise` when it becomes available
 					_ <- Pull.eval(supervisor.supervise[Nothing] {
-						partConsumer(Part(ps.headers, channel.stream.unchunks))
+						partDecoder(Part(ps.headers, channel.stream.unchunks))
+							.value
 							.attempt
 							.evalTap { r => resultPromise.complete(r.flatten) *> channel.close }
-							.rethrow
-							.evalTap { a => IO.println(s"  receiver allocated value: $a") }
 							// tries to allocate the resource but never close it, but since this
 							// will be started by the supervisor, when the supervisor closes, it
 							// will cancel the usage, allowing the resource to release
@@ -98,7 +70,6 @@ object MyMultipart extends IOApp {
 							// when this part of the Pull completes, make sure to close the channel
 							// so that the `receiver` Stream sees an EOF signal.
 							.handleErrorWith { err =>
-								println("  part puller encountered an error")
 								Pull.eval(channel.close) >> Pull.raiseError[IO](err)
 							}
 							.productL { Pull.eval(channel.close) }
@@ -138,41 +109,22 @@ object MyMultipart extends IOApp {
 				Pull.raiseError[IO](new IllegalStateException("Missing PartEnd"))
 		}
 
-		// Translating the stream's effect to `Resource` and using `.eval`
-		// causes all emitted resources to be allocated in a nested manner,
-		// such that when the stream ends, all resources are allocated. We
-		// take advantage of this by collecting them all to a Vector which
-		// can be exposed to client code.
-		pullPartStart(events)
-			.stream
+		events => pullPartStart(events).stream
+	}
+
+	def parseMultipartSupervised[A](
+		events: Stream[IO, Event],
+		supervisor: Supervisor[IO],
+		partConsumer: Part[IO] => EitherT[Resource[IO, *], DecodeFailure, A],
+	): DecodeResult[IO, List[A]] = {
+		decodeMultipartEvents(supervisor, partConsumer)(events)
 			.translate(EitherT.liftK[IO, DecodeFailure])
 			.flatMap(r => Stream.eval(EitherT.fromEither[IO](r)))
 			.compile
 			.toList
 	}
 
-	def superviseResource[A](supervisor: Supervisor[IO], res: Resource[IO, A]): IO[Deferred[IO, Either[Throwable, A]]] = {
-		for {
-			promise <- Deferred[IO, Either[Throwable, A]]
-			// Allocate the resource "forever", until the supervisor wants to release itself.
-			// When the resource allocates or fails to allocate, complete the "promise" so the
-			// caller can un-block its `.get` call.
-			foreverFiber <- supervisor.supervise[Nothing](
-				res
-					.attempt
-					.evalTap(promise.complete)
-					.evalTap(a => IO.println(s"allocated value: $a"))
-					.rethrow
-					.useForever,
-			)
-		} yield promise
-	}
 
-	val receiver = (
-		MultipartReceiver[IO].textPart("foo")(_.readString),
-		MultipartReceiver[IO].filePart("file")(_.toTempFile /*.withSizeLimit(19)*/),
-		MultipartReceiver[IO].auto,
-	).tupled
 
 	def decodeMultipart[A](
 		partEvents: Stream[IO, Event],
@@ -183,37 +135,11 @@ object MyMultipart extends IOApp {
 		parseMultipartSupervised[receiver.Partial](
 			partEvents,
 			supervisor,
-			part => receiverWrapped.decide(part.headers).get.receive(part),
+			part => EitherT(receiverWrapped.decide(part.headers).get.receive(part)),
 		).flatMap { partials =>
 			EitherT.fromEither[IO] { receiver.assemble(partials) }
 		}
 	}
 
-	def run(args: List[String]): IO[ExitCode] = {
-		Supervisor[IO].use { supervisor =>
-			parseMultipartSupervised[receiver.Partial](
-				exampleEvents.covary[IO].metered(50.millis).evalTap(IO.println),
-				supervisor,
-				part => {
-					val r = receiver.decide(part.headers).getOrElse {
-						PartReceiver[IO].reject[receiver.Partial] {
-							part.name match {
-								case None => InvalidMessageBodyFailure("Unexpected anonymous part")
-								case Some(name) => InvalidMessageBodyFailure(s"Unexpected part: '$name'")
-							}
-						}
-					}
-					r.receive(part)
-				},
-			).value.flatMap { res =>
-				val assembledResult = res.flatMap { partials =>
-					receiver.assemble(partials)
-				}
-
-				IO.println(s"[RESULT] All parts hopefully allocated: $assembledResult").as(ExitCode.Success).andWait(1.second)
-			}
-
-		} <* IO.println("closed supervisor")
-	}
 }
 
