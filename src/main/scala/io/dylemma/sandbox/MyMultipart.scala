@@ -4,23 +4,31 @@ import java.nio.charset.StandardCharsets
 import scala.concurrent.duration.DurationInt
 
 import cats.arrow.FunctionK
-import cats.effect.{ ExitCode, IO, IOApp, Resource }
+import cats.data.EitherT
+import cats.effect.std.Supervisor
+import cats.effect.{ Deferred, ExitCode, IO, IOApp, Resource }
+import cats.implicits.catsSyntaxMonadErrorRethrow
 import cats.syntax.traverse._
 import fs2.concurrent.Channel
 import fs2.io.file.Files
 import fs2.{ Chunk, Pull, Stream }
+import org.http4s.Headers
+import org.http4s.multipart.Part
 
 object MyMultipart extends IOApp {
 	sealed trait Event
-	case class PartStart(header: String) extends Event
+	case class PartStart(headers: Headers) extends Event
 	case class PartChunk(chunk: Chunk[Byte]) extends Event
 	case object PartEnd extends Event
 
+	def mockPartStart(name: String) = PartStart(Part.formData[IO](name, "<ignored>").headers)
+	def mockFilePartStart(name: String, filename: String) = PartStart(Part.fileData[IO](name, filename, Stream.empty).headers)
+
 	val exampleEvents = fs2.Stream.emits(List(
-		PartStart("foo"),
+		mockPartStart("foo"),
 		PartChunk(Chunk.array("bar".getBytes(StandardCharsets.UTF_8))),
 		PartEnd,
-		PartStart("bar"),
+		mockFilePartStart("file", "bar.txt"),
 		PartChunk(Chunk.array("""{ "hello": """.getBytes(StandardCharsets.UTF_8))),
 		PartChunk(Chunk.array(""""world" }""".getBytes(StandardCharsets.UTF_8))),
 		PartChunk(Chunk.array("""{ "hello": """.getBytes(StandardCharsets.UTF_8))),
@@ -28,20 +36,21 @@ object MyMultipart extends IOApp {
 		PartChunk(Chunk.array("""{ "hello": """.getBytes(StandardCharsets.UTF_8))),
 		PartChunk(Chunk.array(""""world" }""".getBytes(StandardCharsets.UTF_8))),
 		PartEnd,
-		PartStart("bop"),
+		mockPartStart("bop"),
 		PartChunk(Chunk.array("bippity ".getBytes(StandardCharsets.UTF_8))),
 		PartChunk(Chunk.array("boppity ".getBytes(StandardCharsets.UTF_8))),
 		PartChunk(Chunk.array("boo".getBytes(StandardCharsets.UTF_8))),
 		PartEnd,
 	))
 
-	def parseMultipart[A, E](
+	def parseMultipartSupervised[A, E](
 		events: Stream[IO, Event],
-		decider: PartStart => Stream[IO, Byte] => Resource[IO, Either[E, A]],
-	): Resource[IO, Either[E, Vector[A]]] = {
+		supervisor: Supervisor[IO],
+		decider: Part[IO] => Resource[IO, Either[E, A]],
+	): EitherT[IO, E, Vector[A]] = {
 		def pullPartStart(
 			s: Stream[IO, Event],
-		): Pull[IO, Resource[IO, Either[E, A]], Unit] = s.pull.uncons1.flatMap {
+		): Pull[IO, Either[E, A], Unit] = s.pull.uncons1.flatMap {
 			case Some((ps: PartStart, tail)) =>
 
 				Pull.eval { Channel.synchronous[IO, Chunk[Byte]] }.flatMap { ch =>
@@ -53,7 +62,7 @@ object MyMultipart extends IOApp {
 					// we close the channel once an outcome is reached. Otherwise
 					// the producer side of the channel (i.e. the main Pull loop)
 					// would hang while trying to consume the stream of events.
-					val receiverRes = decider(ps)(ch.stream.unchunks)
+					val receiverRes = decider(Part(ps.headers, ch.stream.unchunks))
 						.evalTap(_ => ch.close)
 						.handleErrorWith { (e: Throwable) =>
 							Resource.eval(ch.close *> IO.raiseError(e))
@@ -69,22 +78,19 @@ object MyMultipart extends IOApp {
 							Pull.eval(ch.close) >> Pull.pure(nextPartsStream)
 						}
 
-					// Run the receiver in the background to avoid deadlocking the Channel.
-					// When the `pullPart` finishes, wait for the resource to be allocated
-					// by joining the fiber created by `.allocatedCase.start`. We defer the
-					// release of the resource by emitting a *new* resource as a Pull.output1,
-					// attaching the original resource's release logic to the result that was
-					// allocated. If the result was a Left, abort the main Pull; otherwise recurse.
-					Pull.eval(receiverRes.allocatedCase.start).flatMap { consumerFiber =>
+					// Allocate the resource in the background, using the supervisor's lifetime to
+					// release it later. Meanwhile, continue to pull chunk data and pipe it through
+					// the shared channel, which should allow the resource to actually allocate.
+					// When the Pull loop reaches the end of the current part, close the channel and
+					// await the resource's allocation before deciding whether to continue pulling.
+					Pull.eval(superviseResource(supervisor, receiverRes)).flatMap { resPromise =>
 						pullPart.flatMap { restOfStream =>
-							Pull.eval(consumerFiber.joinWithNever).flatMap {
-								case (consumerResult, releaseConsumer) =>
-									val resultWrapped = Resource.makeCase(IO.pure(consumerResult)) { (_, exitCase) => releaseConsumer(exitCase) }
-									val cont = consumerResult match {
-										case Left(_) => Pull.done
-										case Right(_) => pullPartStart(restOfStream)
-									}
-									Pull.output1(resultWrapped) >> cont
+							Pull.eval(resPromise.get.rethrow).flatMap { consumerResult =>
+								val cont = consumerResult.fold(
+									e => Pull.done,
+									a => pullPartStart(restOfStream)
+								)
+								Pull.output1(consumerResult) >> cont
 							}
 						}
 					}
@@ -116,45 +122,61 @@ object MyMultipart extends IOApp {
 		// can be exposed to client code.
 		pullPartStart(events)
 			.stream
-			.translate(new FunctionK[IO, Resource[IO, *]] {
-				def apply[A](fa: IO[A]): Resource[IO, A] = Resource.eval(fa)
-			})
-			.flatMap(Stream.eval)
+			.translate(EitherT.liftK[IO, E])
+			.flatMap(r => Stream.eval(EitherT.fromEither[IO](r)))
 			.compile
 			.toVector
-			.map(_.sequence)
 	}
 
-	val partsParsed = parseMultipart(
-		exampleEvents.covary[IO].metered(50.millis).evalTap(IO.println),
-		{
-			case PartStart("foo") =>
-				(s: Stream[IO, Byte]) => {
-					Resource.eval(IO { Right("ignore me" -> "blah") })
-					//					Resource.pure(Left("oopsie"))
-					// Resource.eval(IO.raiseErro
-					// r(new Exception("boom!")))
-					//					Resource.eval(IO.never[(String, String)])
-				}
-			case PartStart(name) =>
-				(s: Stream[IO, Byte]) =>
-					for {
-						_ <- Resource.eval(IO.println(s"  [consumer] Start parsing $name body"))
-						//						body <- s.through(fs2.text.utf8.decode).compile.resource.string
-						tempFile <- Files[IO].tempFile
-						_ <- Resource.eval(s.through(Files[IO].writeAll(tempFile)).compile.drain)
-						//_ <- Resource.make(IO.println(s"Consumed $name as $body. (Allocated)"))(_ => IO.println(s"Release $name resource"))
-						_ <- Resource.make(IO.println(s"  [consumer] Dumped $name body to $tempFile"))(_ => {
-							IO.println(s"  [consumer] Releasing temp file $tempFile")
-						})
-					} yield Right(name -> tempFile.toString)
-		},
-	)
+	def superviseResource[A](supervisor: Supervisor[IO], res: Resource[IO, A]): IO[Deferred[IO, Either[Throwable, A]]] = {
+		for {
+			promise <- Deferred[IO, Either[Throwable, A]]
+			// Allocate the resource "forever", until the supervisor wants to release itself.
+			// When the resource allocates or fails to allocate, complete the "promise" so the
+			// caller can un-block its `.get` call.
+			foreverFiber <- supervisor.supervise[Nothing](
+				res
+					.attempt
+					.evalTap(promise.complete)
+					.rethrow
+					.useForever
+			)
+		} yield promise
+	}
+
+	object NamedPart {
+		def unapply[F[_]](part: Part[F]) = part.name
+	}
 
 	def run(args: List[String]): IO[ExitCode] = {
-		partsParsed.use { allParts =>
-			IO.println(s"[RESULT] All parts hopefully allocated: $allParts").as(ExitCode.Success) <* IO.sleep(1.second)
-		}
+		Supervisor[IO].use { supervisor =>
+			parseMultipartSupervised[(String, String), String](
+				exampleEvents.covary[IO].metered(50.millis).evalTap(IO.println),
+				supervisor,
+				{
+					case p @ NamedPart("foo") =>
+						Resource.eval(IO { Right("ignore me" -> "blah") })
+						//					Resource.pure(Left("oopsie"))
+						// Resource.eval(IO.raiseErro
+						// r(new Exception("boom!")))
+						//					Resource.eval(IO.never[(String, String)])
+					case p @ NamedPart(name) =>
+						for {
+							_ <- Resource.eval(IO.println(s"  [consumer] Start parsing $name body"))
+							//						body <- s.through(fs2.text.utf8.decode).compile.resource.string
+							tempFile <- Files[IO].tempFile
+							_ <- Resource.eval(p.body.through(Files[IO].writeAll(tempFile)).compile.drain)
+							//_ <- Resource.make(IO.println(s"Consumed $name as $body. (Allocated)"))(_ => IO.println(s"Release $name resource"))
+							_ <- Resource.make(IO.println(s"  [consumer] Dumped $name body to $tempFile"))(_ => {
+								IO.println(s"  [consumer] Releasing temp file $tempFile")
+							})
+						} yield Right(name -> tempFile.toString)
+				},
+			).value.flatMap { res =>
+				IO.println(s"[RESULT] All parts hopefully allocated: $res").as(ExitCode.Success).andWait(1.second)
+			}
+
+		} <* IO.println("closed supervisor")
 	}
 }
 
