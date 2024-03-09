@@ -11,7 +11,7 @@ import fs2.concurrent.Channel
 import fs2.io.file.Files
 import fs2.{ Chunk, Pull, Stream }
 import org.http4s.multipart.Part
-import org.http4s.{ Headers, ParseFailure, ParseResult }
+import org.http4s.{ DecodeFailure, DecodeResult, Headers, InvalidMessageBodyFailure, MalformedMessageBodyFailure, ParseResult }
 
 object MyMultipart extends IOApp {
 	sealed trait Event
@@ -44,11 +44,11 @@ object MyMultipart extends IOApp {
 	def parseMultipartSupervised[A](
 		events: Stream[IO, Event],
 		supervisor: Supervisor[IO],
-		partConsumer: Part[IO] => Resource[IO, ParseResult[A]],
-	): EitherT[IO, ParseFailure, List[A]] = {
+		partConsumer: Part[IO] => Resource[IO, Either[DecodeFailure, A]],
+	): EitherT[IO, DecodeFailure, List[A]] = {
 		def pullPartStart(
 			s: Stream[IO, Event],
-		): Pull[IO, ParseResult[A], Unit] = s.pull.uncons1.flatMap {
+		): Pull[IO, Either[DecodeFailure, A], Unit] = s.pull.uncons1.flatMap {
 			case Some((ps: PartStart, tail)) =>
 
 				Pull.eval { Channel.synchronous[IO, Chunk[Byte]] }.flatMap { ch =>
@@ -120,7 +120,7 @@ object MyMultipart extends IOApp {
 		// can be exposed to client code.
 		pullPartStart(events)
 			.stream
-			.translate(EitherT.liftK[IO, ParseFailure])
+			.translate(EitherT.liftK[IO, DecodeFailure])
 			.flatMap(r => Stream.eval(EitherT.fromEither[IO](r)))
 			.compile
 			.toList
@@ -143,9 +143,24 @@ object MyMultipart extends IOApp {
 	}
 
 	val receiver = (
-		MultipartReceiver[IO].expectString("foo"),
+		MultipartReceiver[IO].textPart("foo")(_.readString),
 		MultipartReceiver[IO].auto,
 	).tupled
+
+	def decodeMultipart[A](
+		partEvents: Stream[IO, Event],
+		supervisor: Supervisor[IO],
+		receiver: MultipartReceiver[IO, A],
+	): DecodeResult[IO, A] = {
+		val receiverWrapped = receiver.rejectUnexpectedParts
+		parseMultipartSupervised[receiver.Partial](
+			partEvents,
+			supervisor,
+			part => receiverWrapped.decide(part.headers).get.receive(part)
+		).flatMap { partials =>
+			EitherT.fromEither[IO] { receiver.assemble(partials) }
+		}
+	}
 
 	def run(args: List[String]): IO[ExitCode] = {
 		Supervisor[IO].use { supervisor =>
@@ -156,8 +171,8 @@ object MyMultipart extends IOApp {
 					val r = receiver.decide(part.headers).getOrElse {
 						PartReceiver[IO].reject[receiver.Partial] {
 							part.name match {
-								case None => ParseFailure("Unexpected anonymous part", "")
-								case Some(name) => ParseFailure(s"Unexpected part: '$name'", "")
+								case None => InvalidMessageBodyFailure("Unexpected anonymous part")
+								case Some(name) => InvalidMessageBodyFailure(s"Unexpected part: '$name'")
 							}
 						}
 					}
