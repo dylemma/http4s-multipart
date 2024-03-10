@@ -39,14 +39,14 @@ object MyMultipart {
 	  * @return A pipe that transforms Part events into corresponding
 	  *         decoded values.
 	  */
-	def decodePartsPipe[A](
-		supervisor: Supervisor[IO],
-		partDecoder: Part[IO] => DecodeResult[Resource[IO, *], A],
-	): Pipe[IO, Event, Either[DecodeFailure, A]] = {
+	def decodePartsPipe[F[_], A](
+		supervisor: Supervisor[F],
+		partDecoder: Part[F] => DecodeResult[Resource[F, *], A],
+	)(implicit F: Concurrent[F]): Pipe[F, Event, Either[DecodeFailure, A]] = {
 
 		def pullPartStart(
-			s: Stream[IO, Event],
-		): Pull[IO, Either[DecodeFailure, A], Unit] = s.pull.uncons1.flatMap {
+			s: Stream[F, Event],
+		): Pull[F, Either[DecodeFailure, A], Unit] = s.pull.uncons1.flatMap {
 			case Some((ps: PartStart, tail)) =>
 
 				for {
@@ -54,14 +54,14 @@ object MyMultipart {
 					// logic as a `Stream` consumer rather than some kind of "scan" operation.
 					// As new `PartChunk` events are pulled, they will be sent to the channel,
 					// and concurrently the `partConsumer` will consume the channel's `.stream`.
-					channel <- Pull.eval { Channel.synchronous[IO, Chunk[Byte]] }
+					channel <- Pull.eval { Channel.synchronous[F, Chunk[Byte]] }
 
 					// Since we'll run the `partConsumer` concurrently while pulling chunk events
 					// from the input stream, we use a `Deferred` to allow us to block on the
 					// consumer's completion. This also lets us un-block the event-pull during its
 					// attempts to `send` to the channel, in case the consumer completed without
 					// consuming the entire stream.
-					resultPromise <- Pull.eval { Deferred[IO, Either[Throwable, A]] }
+					resultPromise <- Pull.eval { Deferred[F, Either[Throwable, A]] }
 
 					// Start the "receiver" fiber to run in the background, sending
 					// its result to the `resultPromise` when it becomes available
@@ -83,9 +83,9 @@ object MyMultipart {
 					// receiver raises an error, stop pulling completely
 					restOfStream <- {
 						pullUntilPartEnd(tail, chunk => {
-							val keepPulling = IO.pure(true)
-							val stopPulling = IO.pure(false)
-							IO.race(channel.send(chunk), resultPromise.get).flatMap {
+							val keepPulling = F.pure(true)
+							val stopPulling = F.pure(false)
+							F.race(channel.send(chunk), resultPromise.get).flatMap {
 								case Left(_) => keepPulling // send completed normally; don't care if it was closed or not
 								case Right(Right(a)) => keepPulling // send may have blocked, but the receiver already has a result
 								case Right(Left(err)) => stopPulling // receiver raised an error, so abort the pull
@@ -94,7 +94,7 @@ object MyMultipart {
 							// when this part of the Pull completes, make sure to close the channel
 							// so that the `receiver` Stream sees an EOF signal.
 							.handleErrorWith { err =>
-								Pull.eval(channel.close) >> Pull.raiseError[IO](err)
+								Pull.eval(channel.close) >> Pull.raiseError[F](err)
 							}
 							.productL { Pull.eval(channel.close) }
 					}
@@ -106,8 +106,8 @@ object MyMultipart {
 					// Output the partResult, continuing the Pull if it was not an error
 					_ <- partResult match {
 						case Right(a) => Pull.output1(Right(a)) >> pullPartStart(restOfStream)
-						case Left(e: DecodeFailure) => Pull.output1(Left(e)).covary[IO] >> Pull.done
-						case Left(e) => Pull.raiseError[IO](e)
+						case Left(e: DecodeFailure) => Pull.output1(Left(e)).covary[F] >> Pull.done
+						case Left(e) => Pull.raiseError[F](e)
 					}
 				} yield ()
 
@@ -115,13 +115,13 @@ object MyMultipart {
 				Pull.done
 
 			case Some((PartEnd, _)) =>
-				Pull.raiseError[IO](new IllegalStateException("unexpected PartEnd"))
+				Pull.raiseError[F](new IllegalStateException("unexpected PartEnd"))
 
 			case Some((PartChunk(_), _)) =>
-				Pull.raiseError[IO](new IllegalStateException("unexpected PartChunk"))
+				Pull.raiseError[F](new IllegalStateException("unexpected PartChunk"))
 		}
 
-		def pullUntilPartEnd(s: Stream[IO, Event], pushChunk: Chunk[Byte] => IO[Boolean]): Pull[IO, Nothing, Stream[IO, Event]] = s.pull.uncons1.flatMap {
+		def pullUntilPartEnd(s: Stream[F, Event], pushChunk: Chunk[Byte] => F[Boolean]): Pull[F, Nothing, Stream[F, Event]] = s.pull.uncons1.flatMap {
 			case Some((PartEnd, tail)) =>
 				Pull.pure(tail)
 			case Some((PartChunk(chunk), tail)) =>
@@ -130,36 +130,37 @@ object MyMultipart {
 					else Pull.pure(Stream.empty)
 				}
 			case Some((PartStart(_), _)) | None =>
-				Pull.raiseError[IO](new IllegalStateException("Missing PartEnd"))
+				Pull.raiseError[F](new IllegalStateException("Missing PartEnd"))
 		}
 
 		events => pullPartStart(events).stream
 	}
 
-	def decodeMultipartSupervised[A](
-		events: Stream[IO, Event],
-		supervisor: Supervisor[IO],
-		partConsumer: Part[IO] => EitherT[Resource[IO, *], DecodeFailure, A],
-	): DecodeResult[IO, List[A]] = {
-		decodePartsPipe(supervisor, partConsumer)(events)
-			.translate(EitherT.liftK[IO, DecodeFailure])
-			.flatMap(r => Stream.eval(EitherT.fromEither[IO](r)))
+	def decodeMultipartSupervised[F[_]: Concurrent, A](
+		events: Stream[F, Event],
+		supervisor: Supervisor[F],
+		partConsumer: Part[F] => EitherT[Resource[F, *], DecodeFailure, A],
+	): DecodeResult[F, List[A]] = {
+		events
+			.through { decodePartsPipe(supervisor, partConsumer) }
+			.translate(EitherT.liftK[F, DecodeFailure])
+			.flatMap(r => Stream.eval(EitherT.fromEither[F](r)))
 			.compile
 			.toList
 	}
 
-	def decodeMultipart[A](
-		partEvents: Stream[IO, Event],
-		supervisor: Supervisor[IO],
-		receiver: MultipartReceiver[IO, A],
-	): DecodeResult[IO, A] = {
+	def decodeMultipart[F[_]: Concurrent, A](
+		partEvents: Stream[F, Event],
+		supervisor: Supervisor[F],
+		receiver: MultipartReceiver[F, A],
+	): DecodeResult[F, A] = {
 		val receiverWrapped = receiver.rejectUnexpectedParts
-		decodeMultipartSupervised[receiverWrapped.Partial](
+		decodeMultipartSupervised[F, receiverWrapped.Partial](
 			partEvents,
 			supervisor,
 			part => EitherT(receiverWrapped.decide(part.headers).get.receive(part)),
 		).flatMap { partials =>
-			EitherT.fromEither[IO] { receiverWrapped.assemble(partials) }
+			EitherT.fromEither[F] { receiverWrapped.assemble(partials) }
 		}
 	}
 
