@@ -13,7 +13,5 @@ lazy val root = (project in file("."))
 			"org.http4s" %% "http4s-core" % "0.23.25",
 		),
 		Compile / run / fork := true,
-		addCompilerPlugin("org.typelevel" %% "kind-projector"     % "0.13.3" cross CrossVersion.full),
-		addCompilerPlugin("com.olegpy"    %% "better-monadic-for" % "0.3.1"),
 	)
 
