@@ -15,7 +15,31 @@ object MyMultipart {
 	case class PartChunk(chunk: Chunk[Byte]) extends Event
 	case object PartEnd extends Event
 
-	def decodeMultipartEvents[A](
+	/** Pipe that receives PartStart / PartChunk / PartEnd events,
+	  * extracting the chunk data between each PartStart / PartEnd
+	  * pair and feeding it through a new `partDecoder` for each part.
+	  * Emits the results from each `partDecoder`.
+	  *
+	  * Resources allocated by the returned Pipe are supervised by
+	  * the given `supervisor`, such that when the `supervisor` closes,
+	  * the allocated resources also close.
+	  *
+	  * The `partDecoder` may or may not actually *consume* the part body.
+	  * The underlying parser will wait at a `PartEnd` event until the
+	  * consumer finishes, i.e. the point when its Resource allocates a value
+	  * or raises an error. If the Resource never allocates, the Pipe will
+	  * hang forever.
+	  *
+	  * @param supervisor  A Supervisor used to restrict the lifetimes
+	  *                    of resources allocated by this Pipe
+	  * @param partDecoder A function that consumes the body of a part.
+	  *                    Will be called once for each `PartStart` in
+	  *                    the incoming stream.
+	  * @tparam A Value type returned for each successfully-parsed Part
+	  * @return A pipe that transforms Part events into corresponding
+	  *         decoded values.
+	  */
+	def decodePartsPipe[A](
 		supervisor: Supervisor[IO],
 		partDecoder: Part[IO] => DecodeResult[Resource[IO, *], A],
 	): Pipe[IO, Event, Either[DecodeFailure, A]] = {
@@ -112,19 +136,17 @@ object MyMultipart {
 		events => pullPartStart(events).stream
 	}
 
-	def parseMultipartSupervised[A](
+	def decodeMultipartSupervised[A](
 		events: Stream[IO, Event],
 		supervisor: Supervisor[IO],
 		partConsumer: Part[IO] => EitherT[Resource[IO, *], DecodeFailure, A],
 	): DecodeResult[IO, List[A]] = {
-		decodeMultipartEvents(supervisor, partConsumer)(events)
+		decodePartsPipe(supervisor, partConsumer)(events)
 			.translate(EitherT.liftK[IO, DecodeFailure])
 			.flatMap(r => Stream.eval(EitherT.fromEither[IO](r)))
 			.compile
 			.toList
 	}
-
-
 
 	def decodeMultipart[A](
 		partEvents: Stream[IO, Event],
@@ -132,12 +154,12 @@ object MyMultipart {
 		receiver: MultipartReceiver[IO, A],
 	): DecodeResult[IO, A] = {
 		val receiverWrapped = receiver.rejectUnexpectedParts
-		parseMultipartSupervised[receiver.Partial](
+		decodeMultipartSupervised[receiverWrapped.Partial](
 			partEvents,
 			supervisor,
 			part => EitherT(receiverWrapped.decide(part.headers).get.receive(part)),
 		).flatMap { partials =>
-			EitherT.fromEither[IO] { receiver.assemble(partials) }
+			EitherT.fromEither[IO] { receiverWrapped.assemble(partials) }
 		}
 	}
 

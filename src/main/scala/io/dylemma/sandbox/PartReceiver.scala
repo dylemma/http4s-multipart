@@ -80,7 +80,7 @@ trait MultipartReceiver[F[_], A] { self =>
 	def ignoreUnexpectedParts: MultipartReceiver[F, A] =
 		new MultipartReceiver.IgnoreUnexpected[F, A, Partial](this)
 
-	def rejectUnexpectedParts: MultipartReceiver.Aux[F, A, Partial] =
+	def rejectUnexpectedParts: MultipartReceiver[F, A] =
 		new MultipartReceiver.RejectUnexpected[F, A, Partial](this)
 
 	def transformParts(f: PartReceiver[F, Partial] => PartReceiver[F, Partial]): MultipartReceiver[F, A] =
